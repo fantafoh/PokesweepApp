@@ -8,9 +8,9 @@
     "build": "react-scripts build"
   },
   "dependencies": {
-    "@sparticuz/chromium": "^124.0.0",
+    "@sparticuz/chromium": "latest",
     "cheerio": "^1.0.0-rc.12",
-    "puppeteer-core": "^22.7.1",
+    "puppeteer-core": "latest",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-scripts": "5.0.1"
