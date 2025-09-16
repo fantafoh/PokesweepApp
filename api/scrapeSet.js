@@ -1,29 +1,15 @@
 // api/scrapeSet.js
 // Headless-browser scraper that loads a Pikawiz set page like a real user,
-// then parses card blocks with Cheerio. Compatible with Node 22 and
-// modern puppeteer-core (no waitForTimeout).
+// then parses card blocks by TEXT HEURISTICS (no brittle CSS).
+// Works on Vercel (Node 22) with puppeteer-core + @sparticuz/chromium.
 
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
 import * as cheerio from "cheerio";
 
-export const config = {
-  // Allow enough time for headless browser to launch + load page
-  maxDuration: 25,
-};
+export const config = { maxDuration: 25 };
 
-const CANDIDATE_CARD_SELECTORS = [
-  ".card",
-  ".card-box",
-  ".card-item",
-  "article",
-  "li.card",
-  "div[class*='card']",
-];
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function cleanNum(s) {
   if (!s) return null;
@@ -32,7 +18,7 @@ function cleanNum(s) {
 }
 
 function extractGrades(text) {
-  // Finds patterns like "PSA 10 13,782" or "PSA10 13782"
+  // Finds "PSA 10 13,782" or "PSA10 13782" (multiple times)
   const grades = {};
   const rx = /PSA\s*([0-9]{1,2})\s*([0-9,]+)/gi;
   let m;
@@ -45,9 +31,9 @@ function extractGrades(text) {
 }
 
 function extractTotal(text) {
-  // "Total Population 18,361"
-  const m = /Total\s*Population\s*([0-9,]+)/i.exec(text);
-  return m ? cleanNum(m[1]) : null;
+  // Accepts "Total Population 18,361" OR "Population 18,361"
+  const m = /(Total\s*)?Population\s*([0-9,]+)/i.exec(text);
+  return m ? cleanNum(m[2]) : null;
 }
 
 function extractCardNumberChunk(text) {
@@ -57,27 +43,23 @@ function extractCardNumberChunk(text) {
 }
 
 function extractNameAndDetails($el) {
+  // Try to get a visible name and some detail text from common elements
   const name =
-    $el.find("h2").first().text().trim() ||
-    $el.find("h3").first().text().trim() ||
-    $el.find(".name").first().text().trim() ||
-    "";
+    $el.find("h2, h3, .name, .title").first().text().trim() ||
+    ""; // fallbacks handled by text heuristics
 
+  // detail line often includes rarity + "x/xxx"
   const details =
-    $el.find("p").first().text().trim() ||
-    $el.find(".details").first().text().trim() ||
-    "";
+    $el.find("p, .details, small, .subtitle, .sub").first().text().trim() || "";
 
   return { name, details };
 }
 
 export default async function handler(req, res) {
-  const { setSlug, pokemonName, cardNumber, limit } = req.query;
+  const { setSlug, pokemonName, cardNumber, limit, debug } = req.query;
 
   if (!setSlug) {
-    return res
-      .status(400)
-      .json({ error: "Provide ?setSlug=baseset (or evolvingskies, etc.)" });
+    return res.status(400).json({ error: "Provide ?setSlug=baseset (or evolvingskies, etc.)" });
   }
 
   const slug = String(setSlug).toLowerCase().replace(/\s+/g, "");
@@ -85,11 +67,10 @@ export default async function handler(req, res) {
 
   let browser;
   try {
-    // Launch serverless Chromium (works on Vercel)
+    // Launch serverless Chromium (Vercel compatible)
     browser = await puppeteer.launch({
       args: [
         ...chromium.args,
-        // a couple of stability flags
         "--no-sandbox",
         "--disable-setuid-sandbox",
       ],
@@ -114,84 +95,79 @@ export default async function handler(req, res) {
       Referer: "https://www.pikawiz.com/cards/pop-report",
     });
 
-    // Go to the set page; wait for DOM to be there
+    // Navigate + light waits to get through interstitials
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
-
-    // Small human-like pause
     await sleep(1200);
 
-    // If Cloudflare interstitial appears, give it a moment to auto-continue
     try {
       const t1 = await page.title();
       if (/just a moment/i.test(t1)) {
         await sleep(4000);
       }
-    } catch {
-      // ignore title read errors
-    }
+    } catch {}
 
-    // Wait for the main content signal: the phrase "Total Population" somewhere on the page
-    // (We don't know exact selectors; this is a robust content wait.)
+    // Wait until the page has content that looks like PSA or card numbers
     try {
       await page.waitForFunction(
         () =>
           typeof document !== "undefined" &&
           document.body &&
-          /Total\s*Population/i.test(document.body.innerText),
+          /PSA\s*\d|(\d{1,4}\s*\/\s*\d{1,4})/i.test(document.body.innerText),
         { timeout: 15000 }
       );
     } catch {
-      // If it times out, we'll still try to parse whatever rendered.
+      // still try to parse
     }
 
     const html = await page.content();
     const $ = cheerio.load(html);
 
-    // Try multiple selectors, pick the one with the most matches
-    let bestSelector = null;
-    let best = [];
-    for (const sel of CANDIDATE_CARD_SELECTORS) {
-      const found = $(sel).toArray();
-      if (found.length > best.length) {
-        best = found;
-        bestSelector = sel;
-      }
-    }
+    // Broad sweep: consider any section/article/div as a potential "card box"
+    const candidates = $("section, article, div").toArray();
 
-    // Fallback: any div that contains "Total Population"
-    if (best.length === 0) {
-      const allDivs = $("div").toArray();
-      const candidates = allDivs.filter((el) =>
-        $(el).text().toLowerCase().includes("total population")
-      );
-      best = candidates;
-      bestSelector = "(heuristic div contains 'Total Population')";
-    }
-
-    const rows = [];
-    for (const el of best) {
+    const blocks = [];
+    for (const el of candidates) {
       const $el = $(el);
       const text = $el.text().replace(/\s+/g, " ").trim();
-      if (!/total\s*population/i.test(text)) continue;
 
-      const { name, details } = extractNameAndDetails($el);
-      const totalPop = extractTotal(text);
+      // Keep blocks that look like a card entry:
+      // - must contain at least one PSA grade OR a card number like "x/xxx"
+      if (!/(PSA\s*\d)|(\d{1,4}\s*\/\s*\d{1,4})/i.test(text)) continue;
+
       const grades = extractGrades(text);
-      const numberChunk =
-        extractCardNumberChunk(text) || extractCardNumberChunk(details);
-      if (!name && !details) continue;
+      // If there are zero grades and no total pop and no number, it's probably noise
+      const totalPop = extractTotal(text);
+      const numChunk = extractCardNumberChunk(text);
 
-      rows.push({
+      // Try to pluck a name/details if present
+      const { name, details } = extractNameAndDetails($el);
+
+      // Heuristic to reduce noise: require at least grades or a number chunk
+      if (Object.keys(grades).length === 0 && !numChunk) continue;
+
+      blocks.push({
         name,
         details,
-        cardNumber: numberChunk || null,
+        cardNumber: numChunk || null,
         totalPop,
         grades,
+        _len: text.length // for debugging ordering (longer blocks are likelier to be real)
       });
     }
 
-    // Optional filtering
+    // De-duplicate obvious repeats by (name + number)
+    const seen = new Set();
+    const rows = [];
+    for (const b of blocks) {
+      const key = `${(b.name || "").toLowerCase()}|${b.cardNumber || ""}`;
+      if (seen.has(key) && key !== "|") continue;
+      seen.add(key);
+      rows.push(b);
+    }
+
+    // Optional filtering by user query
     let filtered = rows;
+
     if (pokemonName) {
       const q = String(pokemonName).toLowerCase();
       filtered = filtered.filter(
@@ -200,6 +176,7 @@ export default async function handler(req, res) {
           (r.details && r.details.toLowerCase().includes(q))
       );
     }
+
     if (cardNumber) {
       const want = String(cardNumber).replace(/\s+/g, "");
       filtered = filtered.filter(
@@ -207,27 +184,38 @@ export default async function handler(req, res) {
       );
     }
 
+    // Sort longer/more detailed blocks first (tends to be higher-quality matches)
+    filtered.sort((a, b) => (b._len || 0) - (a._len || 0));
+
+    // Respect limit
     const lim = limit ? Math.max(1, Math.min(200, Number(limit))) : null;
     const out = lim ? filtered.slice(0, lim) : filtered;
 
-    return res.status(200).json({
+    const resp = {
       ok: true,
       source: url,
-      selectorUsed: bestSelector,
       totalFound: rows.length,
       returned: out.length,
       filteredBy: { pokemonName: pokemonName || null, cardNumber: cardNumber || null },
-      cards: out,
-    });
+      cards: out.map(({ _len, ...rest }) => rest)
+    };
+
+    if (debug) {
+      // small debug signals to help tune parsers without dumping full HTML
+      resp.debug = {
+        nodeCount: candidates.length,
+        blockCount: blocks.length,
+        sampleTextHints: [
+          $("body").text().slice(0, 200).replace(/\s+/g, " "),
+          $("body").text().slice(200, 400).replace(/\s+/g, " ")
+        ]
+      };
+    }
+
+    return res.status(200).json(resp);
   } catch (err) {
     return res.status(500).json({ error: String(err), hint: "Headless scrape failed" });
   } finally {
-    if (browser) {
-      try {
-        await browser.close();
-      } catch {
-        // ignore
-      }
-    }
+    if (browser) { try { await browser.close(); } catch {} }
   }
 }
