@@ -1,7 +1,7 @@
 // api/scrapeSet.js
-// Headless-browser scraper that loads a Pikawiz set page like a real user,
-// then parses card blocks by TEXT HEURISTICS (no brittle CSS).
-// Works on Vercel (Node 22) with puppeteer-core + @sparticuz/chromium.
+// Headless-browser scraper for Pikawiz pop report pages using Puppeteer-Core + @sparticuz/chromium.
+// Tight heuristics: keep only blocks with a card number (e.g. 4/102) AND 3+ distinct PSA grade lines.
+// Works on Node 22 on Vercel.
 
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
@@ -17,42 +17,51 @@ function cleanNum(s) {
   return m ? Number(m) : null;
 }
 
-function extractGrades(text) {
-  // Finds "PSA 10 13,782" or "PSA10 13782" (multiple times)
-  const grades = {};
+function findGrades(text) {
+  // capture multiple "PSA 10 13,782" / "PSA10 13782"
+  const out = [];
   const rx = /PSA\s*([0-9]{1,2})\s*([0-9,]+)/gi;
   let m;
-  while ((m = rx.exec(text))) {
-    const grade = m[1];
-    const val = cleanNum(m[2]);
-    if (val != null) grades[`PSA ${grade}`] = val;
+  while ((m = rx.exec(text))) out.push({ grade: m[1], value: cleanNum(m[2]) });
+  return out;
+}
+
+function extractGradesMap(text) {
+  const grades = {};
+  for (const g of findGrades(text)) {
+    if (g.value != null) grades[`PSA ${g.grade}`] = g.value;
   }
   return grades;
 }
 
 function extractTotal(text) {
-  // Accepts "Total Population 18,361" OR "Population 18,361"
+  // "Total Population 18,361" OR "Population 18,361"
   const m = /(Total\s*)?Population\s*([0-9,]+)/i.exec(text);
   return m ? cleanNum(m[2]) : null;
 }
 
-function extractCardNumberChunk(text) {
-  // Grabs things like "215/203" or "4/102"
+function extractCardNumber(text) {
+  // "215/203", "4/102"
   const m = /(\d{1,4}\s*\/\s*\d{1,4})/.exec(text);
   return m ? m[1].replace(/\s+/g, "") : null;
 }
 
 function extractNameAndDetails($el) {
-  // Try to get a visible name and some detail text from common elements
   const name =
-    $el.find("h2, h3, .name, .title").first().text().trim() ||
-    ""; // fallbacks handled by text heuristics
-
-  // detail line often includes rarity + "x/xxx"
+    $el.find("h2, h3, .name, .title").first().text().trim() || "";
   const details =
     $el.find("p, .details, small, .subtitle, .sub").first().text().trim() || "";
-
   return { name, details };
+}
+
+// Fallback name guess: take the words preceding the first "x/xxx" number chunk
+function fallbackNameFromText(text) {
+  // capture up to ~60 chars before the number
+  const m = /([A-Za-z0-9'’\- :]{2,60})\s+\d{1,4}\s*\/\s*\d{1,4}/.exec(text);
+  if (!m) return "";
+  // trim off obvious labels like "Pop Report"
+  const guess = m[1].replace(/\b(Pop(ulation)?\s*Report)\b/i, "").trim();
+  return guess;
 }
 
 export default async function handler(req, res) {
@@ -67,7 +76,6 @@ export default async function handler(req, res) {
 
   let browser;
   try {
-    // Launch serverless Chromium (Vercel compatible)
     browser = await puppeteer.launch({
       args: [
         ...chromium.args,
@@ -81,7 +89,6 @@ export default async function handler(req, res) {
 
     const page = await browser.newPage();
 
-    // Spoof a normal desktop browser
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     );
@@ -95,77 +102,81 @@ export default async function handler(req, res) {
       Referer: "https://www.pikawiz.com/cards/pop-report",
     });
 
-    // Navigate + light waits to get through interstitials
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
-    await sleep(1200);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 25000 });
+    await sleep(1400);
 
+    // If Cloudflare interstitial appears, give it a moment
     try {
       const t1 = await page.title();
-      if (/just a moment/i.test(t1)) {
-        await sleep(4000);
-      }
+      if (/just a moment/i.test(t1)) await sleep(4500);
     } catch {}
 
-    // Wait until the page has content that looks like PSA or card numbers
+    // Wait for content hint: PSA grades or card number pattern somewhere
     try {
       await page.waitForFunction(
         () =>
           typeof document !== "undefined" &&
           document.body &&
-          /PSA\s*\d|(\d{1,4}\s*\/\s*\d{1,4})/i.test(document.body.innerText),
+          (/PSA\s*\d/i.test(document.body.innerText) ||
+           /\d{1,4}\s*\/\s*\d{1,4}/.test(document.body.innerText)),
         { timeout: 15000 }
       );
-    } catch {
-      // still try to parse
-    }
+    } catch {}
 
     const html = await page.content();
     const $ = cheerio.load(html);
 
-    // Broad sweep: consider any section/article/div as a potential "card box"
-    const candidates = $("section, article, div").toArray();
+    // Consider blocks: we’ll scan a manageable subset of elements
+    // Use only elements likely to be "cards" (reduce noise)
+    const candidates = $("article, section, li, div").toArray();
 
-    const blocks = [];
+    const kept = [];
     for (const el of candidates) {
       const $el = $(el);
-      const text = $el.text().replace(/\s+/g, " ").trim();
+      const raw = $el.text().replace(/\s+/g, " ").trim();
+      if (!raw) continue;
 
-      // Keep blocks that look like a card entry:
-      // - must contain at least one PSA grade OR a card number like "x/xxx"
-      if (!/(PSA\s*\d)|(\d{1,4}\s*\/\s*\d{1,4})/i.test(text)) continue;
+      const num = extractCardNumber(raw);
+      if (!num) continue; // must have x/xxx
 
-      const grades = extractGrades(text);
-      // If there are zero grades and no total pop and no number, it's probably noise
-      const totalPop = extractTotal(text);
-      const numChunk = extractCardNumberChunk(text);
+      const gradeList = findGrades(raw);
+      const distinctGrades = new Set(gradeList.map(g => g.grade)).size;
+      if (distinctGrades < 3) continue; // require at least 3 unique PSA grades inside the same block
 
-      // Try to pluck a name/details if present
-      const { name, details } = extractNameAndDetails($el);
+      // Looks like a real card block; extract fields
+      let { name, details } = extractNameAndDetails($el);
+      if (!name) {
+        const guess = fallbackNameFromText(raw);
+        if (guess) name = guess;
+      }
 
-      // Heuristic to reduce noise: require at least grades or a number chunk
-      if (Object.keys(grades).length === 0 && !numChunk) continue;
+      const grades = extractGradesMap(raw);
+      const totalPop = extractTotal(raw);
 
-      blocks.push({
+      // sanity: avoid obvious noise blocks
+      if (Object.keys(grades).length === 0) continue;
+
+      kept.push({
         name,
         details,
-        cardNumber: numChunk || null,
+        cardNumber: num,
         totalPop,
         grades,
-        _len: text.length // for debugging ordering (longer blocks are likelier to be real)
+        _len: raw.length
       });
     }
 
-    // De-duplicate obvious repeats by (name + number)
+    // De-duplicate by (name|cardNumber)
     const seen = new Set();
     const rows = [];
-    for (const b of blocks) {
-      const key = `${(b.name || "").toLowerCase()}|${b.cardNumber || ""}`;
-      if (seen.has(key) && key !== "|") continue;
+    for (const b of kept) {
+      const key = `${(b.name || "").toLowerCase()}|${b.cardNumber}`;
+      if (seen.has(key)) continue;
       seen.add(key);
       rows.push(b);
     }
 
-    // Optional filtering by user query
+    // Optional filtering
     let filtered = rows;
 
     if (pokemonName) {
@@ -179,19 +190,16 @@ export default async function handler(req, res) {
 
     if (cardNumber) {
       const want = String(cardNumber).replace(/\s+/g, "");
-      filtered = filtered.filter(
-        (r) => r.cardNumber && r.cardNumber.replace(/\s+/g, "") === want
-      );
+      filtered = filtered.filter((r) => r.cardNumber === want);
     }
 
-    // Sort longer/more detailed blocks first (tends to be higher-quality matches)
+    // Prefer richer blocks (longer text usually)
     filtered.sort((a, b) => (b._len || 0) - (a._len || 0));
 
-    // Respect limit
     const lim = limit ? Math.max(1, Math.min(200, Number(limit))) : null;
     const out = lim ? filtered.slice(0, lim) : filtered;
 
-    const resp = {
+    const response = {
       ok: true,
       source: url,
       totalFound: rows.length,
@@ -201,18 +209,13 @@ export default async function handler(req, res) {
     };
 
     if (debug) {
-      // small debug signals to help tune parsers without dumping full HTML
-      resp.debug = {
-        nodeCount: candidates.length,
-        blockCount: blocks.length,
-        sampleTextHints: [
-          $("body").text().slice(0, 200).replace(/\s+/g, " "),
-          $("body").text().slice(200, 400).replace(/\s+/g, " ")
-        ]
+      response.debug = {
+        candidatesScanned: candidates.length,
+        keptBlocks: kept.length
       };
     }
 
-    return res.status(200).json(resp);
+    return res.status(200).json(response);
   } catch (err) {
     return res.status(500).json({ error: String(err), hint: "Headless scrape failed" });
   } finally {
