@@ -1,9 +1,15 @@
 // api/scrapeSet.js
-// Fetch a Pikawiz pop-report page by set slug (e.g., baseset, evolvingskies),
-// parse each card block, and optionally filter by pokemonName and/or cardNumber.
-// Uses "human-like" headers to reduce 403 blocks.
+// Headless-browser scraper that loads Pikawiz set page like a real user,
+// then parses card blocks with Cheerio. Works around 403/anti-bot pages.
 
+import chromium from "@sparticuz/chromium";
+import puppeteer from "puppeteer-core";
 import * as cheerio from "cheerio";
+
+// Allow up to ~25s to load (adjustable)
+export const config = {
+  maxDuration: 25
+};
 
 const CANDIDATE_CARD_SELECTORS = [
   ".card",
@@ -11,7 +17,7 @@ const CANDIDATE_CARD_SELECTORS = [
   ".card-item",
   "article",
   "li.card",
-  "div[class*='card']",
+  "div[class*='card']"
 ];
 
 function cleanNum(s) {
@@ -21,7 +27,6 @@ function cleanNum(s) {
 }
 
 function extractGrades(text) {
-  // Finds patterns like "PSA 10 13,782" or "PSA10 13782"
   const grades = {};
   const rx = /PSA\s*([0-9]{1,2})\s*([0-9,]+)/gi;
   let m;
@@ -34,13 +39,11 @@ function extractGrades(text) {
 }
 
 function extractTotal(text) {
-  // "Total Population 18,361"
   const m = /Total\s*Population\s*([0-9,]+)/i.exec(text);
   return m ? cleanNum(m[1]) : null;
 }
 
 function extractCardNumberChunk(text) {
-  // Grabs things like "215/203" or "4/102"
   const m = /(\d{1,4}\s*\/\s*\d{1,4})/.exec(text);
   return m ? m[1].replace(/\s+/g, "") : null;
 }
@@ -51,65 +54,66 @@ function extractNameAndDetails($el) {
     $el.find("h3").first().text().trim() ||
     $el.find(".name").first().text().trim() ||
     "";
-
   const details =
     $el.find("p").first().text().trim() ||
     $el.find(".details").first().text().trim() ||
     "";
-
   return { name, details };
 }
 
 export default async function handler(req, res) {
   const { setSlug, pokemonName, cardNumber, limit } = req.query;
-
   if (!setSlug) {
-    return res
-      .status(400)
-      .json({ error: "Provide ?setSlug=baseset (or evolvingskies, etc.)" });
+    return res.status(400).json({ error: "Provide ?setSlug=baseset (or evolvingskies, etc.)" });
   }
 
-  try {
-    const slug = String(setSlug).toLowerCase().replace(/\s+/g, "");
-    const url = `https://www.pikawiz.com/cards/pop-report/${encodeURIComponent(slug)}`;
+  const slug = String(setSlug).toLowerCase().replace(/\s+/g, "");
+  const url = `https://www.pikawiz.com/cards/pop-report/${encodeURIComponent(slug)}`;
 
-    // --- "Human-like" headers to reduce 403s ---
-    const r = await fetch(url, {
-      method: "GET",
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept":
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Referer": "https://www.pikawiz.com/cards/pop-report",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-      },
+  let browser;
+  try {
+    // Launch serverless Chromium (works on Vercel)
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless
     });
 
-    if (!r.ok) {
-      const body = await r.text().catch(() => "");
-      return res.status(r.status).json({
-        error: `Failed to fetch set page (${r.status})`,
-        url,
-        hint:
-          r.status === 403
-            ? "Site likely blocking serverless requests. We can switch to a headless-browser approach if needed."
-            : "Non-200 status from source site.",
-        sample: body.slice(0, 300),
-      });
+    const page = await browser.newPage();
+
+    // Spoof a normal desktop browser
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    );
+    await page.setExtraHTTPHeaders({
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Upgrade-Insecure-Requests": "1",
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache",
+      "Referer": "https://www.pikawiz.com/cards/pop-report"
+    });
+
+    // Go to the page and wait for network to settle
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+
+    // Small human-like pause (helps with some anti-bot)
+    await page.waitForTimeout(1200);
+
+    // If Cloudflare interstitial appears, wait a bit longer for redirect
+    // (title often "Just a moment...")
+    const title = await page.title();
+    if (/just a moment/i.test(title)) {
+      await page.waitForTimeout(4000);
     }
 
-    const html = await r.text();
+    // Grab the rendered HTML
+    const html = await page.content();
     const $ = cheerio.load(html);
 
-    // Try multiple selectors, pick the one with the most matches
+    // Try multiple selectors, pick the richest one
     let bestSelector = null;
     let best = [];
     for (const sel of CANDIDATE_CARD_SELECTORS) {
@@ -134,14 +138,12 @@ export default async function handler(req, res) {
     for (const el of best) {
       const $el = $(el);
       const text = $el.text().replace(/\s+/g, " ").trim();
-      if (!/total\s*population/i.test(text)) continue; // sanity check
+      if (!/total\s*population/i.test(text)) continue;
 
       const { name, details } = extractNameAndDetails($el);
       const totalPop = extractTotal(text);
       const grades = extractGrades(text);
-      const numberChunk =
-        extractCardNumberChunk(text) || extractCardNumberChunk(details);
-
+      const numberChunk = extractCardNumberChunk(text) || extractCardNumberChunk(details);
       if (!name && !details) continue;
 
       rows.push({
@@ -149,13 +151,12 @@ export default async function handler(req, res) {
         details,
         cardNumber: numberChunk || null,
         totalPop,
-        grades,
+        grades
       });
     }
 
     // Optional filtering
     let filtered = rows;
-
     if (pokemonName) {
       const q = String(pokemonName).toLowerCase();
       filtered = filtered.filter(
@@ -164,7 +165,6 @@ export default async function handler(req, res) {
           (r.details && r.details.toLowerCase().includes(q))
       );
     }
-
     if (cardNumber) {
       const want = String(cardNumber).replace(/\s+/g, "");
       filtered = filtered.filter(
@@ -181,13 +181,14 @@ export default async function handler(req, res) {
       selectorUsed: bestSelector,
       totalFound: rows.length,
       returned: out.length,
-      filteredBy: {
-        pokemonName: pokemonName || null,
-        cardNumber: cardNumber || null,
-      },
-      cards: out,
+      filteredBy: { pokemonName: pokemonName || null, cardNumber: cardNumber || null },
+      cards: out
     });
   } catch (err) {
-    return res.status(500).json({ error: String(err) });
+    return res.status(500).json({ error: String(err), hint: "Headless scrape failed" });
+  } finally {
+    if (browser) {
+      try { await browser.close(); } catch {}
+    }
   }
 }
