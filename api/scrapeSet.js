@@ -1,14 +1,15 @@
 // api/scrapeSet.js
-// Headless-browser scraper that loads Pikawiz set page like a real user,
-// then parses card blocks with Cheerio. Works around 403/anti-bot pages.
+// Headless-browser scraper that loads a Pikawiz set page like a real user,
+// then parses card blocks with Cheerio. Compatible with Node 22 and
+// modern puppeteer-core (no waitForTimeout).
 
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
 import * as cheerio from "cheerio";
 
-// Allow up to ~25s to load (adjustable)
 export const config = {
-  maxDuration: 25
+  // Allow enough time for headless browser to launch + load page
+  maxDuration: 25,
 };
 
 const CANDIDATE_CARD_SELECTORS = [
@@ -17,8 +18,12 @@ const CANDIDATE_CARD_SELECTORS = [
   ".card-item",
   "article",
   "li.card",
-  "div[class*='card']"
+  "div[class*='card']",
 ];
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function cleanNum(s) {
   if (!s) return null;
@@ -27,6 +32,7 @@ function cleanNum(s) {
 }
 
 function extractGrades(text) {
+  // Finds patterns like "PSA 10 13,782" or "PSA10 13782"
   const grades = {};
   const rx = /PSA\s*([0-9]{1,2})\s*([0-9,]+)/gi;
   let m;
@@ -39,11 +45,13 @@ function extractGrades(text) {
 }
 
 function extractTotal(text) {
+  // "Total Population 18,361"
   const m = /Total\s*Population\s*([0-9,]+)/i.exec(text);
   return m ? cleanNum(m[1]) : null;
 }
 
 function extractCardNumberChunk(text) {
+  // Grabs things like "215/203" or "4/102"
   const m = /(\d{1,4}\s*\/\s*\d{1,4})/.exec(text);
   return m ? m[1].replace(/\s+/g, "") : null;
 }
@@ -54,17 +62,22 @@ function extractNameAndDetails($el) {
     $el.find("h3").first().text().trim() ||
     $el.find(".name").first().text().trim() ||
     "";
+
   const details =
     $el.find("p").first().text().trim() ||
     $el.find(".details").first().text().trim() ||
     "";
+
   return { name, details };
 }
 
 export default async function handler(req, res) {
   const { setSlug, pokemonName, cardNumber, limit } = req.query;
+
   if (!setSlug) {
-    return res.status(400).json({ error: "Provide ?setSlug=baseset (or evolvingskies, etc.)" });
+    return res
+      .status(400)
+      .json({ error: "Provide ?setSlug=baseset (or evolvingskies, etc.)" });
   }
 
   const slug = String(setSlug).toLowerCase().replace(/\s+/g, "");
@@ -74,10 +87,15 @@ export default async function handler(req, res) {
   try {
     // Launch serverless Chromium (works on Vercel)
     browser = await puppeteer.launch({
-      args: chromium.args,
+      args: [
+        ...chromium.args,
+        // a couple of stability flags
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+      ],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
-      headless: chromium.headless
+      headless: chromium.headless,
     });
 
     const page = await browser.newPage();
@@ -87,33 +105,49 @@ export default async function handler(req, res) {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     );
     await page.setExtraHTTPHeaders({
-      "Accept":
+      Accept:
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9",
       "Upgrade-Insecure-Requests": "1",
       "Cache-Control": "no-cache",
-      "Pragma": "no-cache",
-      "Referer": "https://www.pikawiz.com/cards/pop-report"
+      Pragma: "no-cache",
+      Referer: "https://www.pikawiz.com/cards/pop-report",
     });
 
-    // Go to the page and wait for network to settle
+    // Go to the set page; wait for DOM to be there
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
 
-    // Small human-like pause (helps with some anti-bot)
-    await page.waitForTimeout(1200);
+    // Small human-like pause
+    await sleep(1200);
 
-    // If Cloudflare interstitial appears, wait a bit longer for redirect
-    // (title often "Just a moment...")
-    const title = await page.title();
-    if (/just a moment/i.test(title)) {
-      await page.waitForTimeout(4000);
+    // If Cloudflare interstitial appears, give it a moment to auto-continue
+    try {
+      const t1 = await page.title();
+      if (/just a moment/i.test(t1)) {
+        await sleep(4000);
+      }
+    } catch {
+      // ignore title read errors
     }
 
-    // Grab the rendered HTML
+    // Wait for the main content signal: the phrase "Total Population" somewhere on the page
+    // (We don't know exact selectors; this is a robust content wait.)
+    try {
+      await page.waitForFunction(
+        () =>
+          typeof document !== "undefined" &&
+          document.body &&
+          /Total\s*Population/i.test(document.body.innerText),
+        { timeout: 15000 }
+      );
+    } catch {
+      // If it times out, we'll still try to parse whatever rendered.
+    }
+
     const html = await page.content();
     const $ = cheerio.load(html);
 
-    // Try multiple selectors, pick the richest one
+    // Try multiple selectors, pick the one with the most matches
     let bestSelector = null;
     let best = [];
     for (const sel of CANDIDATE_CARD_SELECTORS) {
@@ -143,7 +177,8 @@ export default async function handler(req, res) {
       const { name, details } = extractNameAndDetails($el);
       const totalPop = extractTotal(text);
       const grades = extractGrades(text);
-      const numberChunk = extractCardNumberChunk(text) || extractCardNumberChunk(details);
+      const numberChunk =
+        extractCardNumberChunk(text) || extractCardNumberChunk(details);
       if (!name && !details) continue;
 
       rows.push({
@@ -151,7 +186,7 @@ export default async function handler(req, res) {
         details,
         cardNumber: numberChunk || null,
         totalPop,
-        grades
+        grades,
       });
     }
 
@@ -182,13 +217,17 @@ export default async function handler(req, res) {
       totalFound: rows.length,
       returned: out.length,
       filteredBy: { pokemonName: pokemonName || null, cardNumber: cardNumber || null },
-      cards: out
+      cards: out,
     });
   } catch (err) {
     return res.status(500).json({ error: String(err), hint: "Headless scrape failed" });
   } finally {
     if (browser) {
-      try { await browser.close(); } catch {}
+      try {
+        await browser.close();
+      } catch {
+        // ignore
+      }
     }
   }
 }
