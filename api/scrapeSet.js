@@ -1,18 +1,17 @@
 // api/scrapeSet.js
 // Fetch a Pikawiz pop-report page by set slug (e.g., baseset, evolvingskies),
-// parse each card block, and (optionally) filter by pokemonName and/or cardNumber.
-// Returns PSA grade pops (10→1) plus name/details/totalPop.
+// parse each card block, and optionally filter by pokemonName and/or cardNumber.
+// Uses "human-like" headers to reduce 403 blocks.
 
 import * as cheerio from "cheerio";
 
 const CANDIDATE_CARD_SELECTORS = [
-  ".card",                 // common guess
+  ".card",
   ".card-box",
   ".card-item",
   "article",
   "li.card",
   "div[class*='card']",
-  "div:has(h2):has(:contains('Total'))", // heuristic
 ];
 
 function cleanNum(s) {
@@ -22,7 +21,7 @@ function cleanNum(s) {
 }
 
 function extractGrades(text) {
-  // Find "PSA 10 1234", "PSA10 1,234", etc.
+  // Finds patterns like "PSA 10 13,782" or "PSA10 13782"
   const grades = {};
   const rx = /PSA\s*([0-9]{1,2})\s*([0-9,]+)/gi;
   let m;
@@ -41,20 +40,18 @@ function extractTotal(text) {
 }
 
 function extractCardNumberChunk(text) {
-  // Grab things like "215/203" or "4/102"
+  // Grabs things like "215/203" or "4/102"
   const m = /(\d{1,4}\s*\/\s*\d{1,4})/.exec(text);
   return m ? m[1].replace(/\s+/g, "") : null;
 }
 
 function extractNameAndDetails($el) {
-  // Try several places for name and details
   const name =
     $el.find("h2").first().text().trim() ||
     $el.find("h3").first().text().trim() ||
     $el.find(".name").first().text().trim() ||
     "";
 
-  // details often in a <p>, sometimes in small/subtitle
   const details =
     $el.find("p").first().text().trim() ||
     $el.find(".details").first().text().trim() ||
@@ -73,22 +70,46 @@ export default async function handler(req, res) {
   }
 
   try {
-    const url = `https://www.pikawiz.com/cards/pop-report/${encodeURIComponent(
-      setSlug.toLowerCase().replace(/\s+/g, "")
-    )}`;
+    const slug = String(setSlug).toLowerCase().replace(/\s+/g, "");
+    const url = `https://www.pikawiz.com/cards/pop-report/${encodeURIComponent(slug)}`;
 
-    // Fetch the set page
-    const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0" } });
+    // --- "Human-like" headers to reduce 403s ---
+    const r = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": "https://www.pikawiz.com/cards/pop-report",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+      },
+    });
+
     if (!r.ok) {
+      const body = await r.text().catch(() => "");
       return res.status(r.status).json({
         error: `Failed to fetch set page (${r.status})`,
         url,
+        hint:
+          r.status === 403
+            ? "Site likely blocking serverless requests. We can switch to a headless-browser approach if needed."
+            : "Non-200 status from source site.",
+        sample: body.slice(0, 300),
       });
     }
+
     const html = await r.text();
     const $ = cheerio.load(html);
 
-    // Find card blocks by trying multiple selectors; pick the selector with most hits.
+    // Try multiple selectors, pick the one with the most matches
     let bestSelector = null;
     let best = [];
     for (const sel of CANDIDATE_CARD_SELECTORS) {
@@ -99,7 +120,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Fallback: if we still found nothing, try a very loose heuristic: blocks containing "Total Population"
+    // Fallback: any div that contains "Total Population"
     if (best.length === 0) {
       const allDivs = $("div").toArray();
       const candidates = allDivs.filter((el) =>
@@ -118,9 +139,9 @@ export default async function handler(req, res) {
       const { name, details } = extractNameAndDetails($el);
       const totalPop = extractTotal(text);
       const grades = extractGrades(text);
-      const numberChunk = extractCardNumberChunk(text) || extractCardNumberChunk(details);
+      const numberChunk =
+        extractCardNumberChunk(text) || extractCardNumberChunk(details);
 
-      // Skip obviously empty blocks
       if (!name && !details) continue;
 
       rows.push({
@@ -151,7 +172,6 @@ export default async function handler(req, res) {
       );
     }
 
-    // Optional limit to keep payload small
     const lim = limit ? Math.max(1, Math.min(200, Number(limit))) : null;
     const out = lim ? filtered.slice(0, lim) : filtered;
 
